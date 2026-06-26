@@ -1,0 +1,13 @@
+name: headless
+description: Headless Dart logic for patient-controlled scan sharing (Phase 1).
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.9.0
+
+dependencies:
+  at_client: ^3.0.0
+  at_onboarding_cli: ^1.15.0
+  at_utils: ^3.0.0
+  args: ^2.4.0

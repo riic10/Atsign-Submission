@@ -1,0 +1,12 @@
+# Claude Code
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+
+# Private design docs
+design-reference.md
+
+# Dart / build artifacts
+.dart_tool/
+build/
+storage/

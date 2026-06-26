@@ -9,6 +9,10 @@ import 'package:at_utils/at_logger.dart';
 
 const namespace = 'medshare';
 const rootDomain = 'root.atsign.org';
+
+// The imaging source that originates the scan and hands it to the patient.
+// Its .atKeys must be present locally to authenticate as the clinic.
+const clinic = '@radium1if01_np';
 const patient = '@stellar7gf01_np';
 
 // The recipient the patient shares with. Mutable so the app can target a
@@ -90,7 +94,42 @@ AtKey scanKey({Duration? ttl}) => AtKey()
     ..ccd = true
     ..ttl = ttl?.inMilliseconds);
 
+// The clinic->patient delivery. ttr caches it at the patient so they hold the
+// scan and can re-share it onward. This is the design's "hand over the scan"
+// edge, made real.
+AtKey deliveryKey() => AtKey()
+  ..key = 'scan'
+  ..namespace = namespace
+  ..sharedBy = clinic
+  ..sharedWith = patient
+  ..metadata = (Metadata()..ttr = -1);
+
 // ---- High-level operations used by both the console tools and the app. ----
+
+// Clinic locks the scan to the patient and delivers it.
+Future<void> clinicDeliverScan(Uint8List bytes) async {
+  await withClient(clinic, (client) async {
+    await client.put(deliveryKey(), base64Encode(bytes));
+  });
+}
+
+// Patient receives the scan the clinic delivered, or null if none yet.
+Future<Uint8List?> patientReceiveScan() async {
+  Uint8List? out;
+  await withClient(patient, (client) async {
+    try {
+      final result = await client.get(
+        deliveryKey(),
+        getRequestOptions: GetRequestOptions()..bypassCache = true,
+      );
+      final value = result.value;
+      if (value is String && value.isNotEmpty) out = base64Decode(value);
+    } catch (_) {
+      out = null;
+    }
+  });
+  return out;
+}
 
 // Patient shares the scan image with the specialist, optionally time-limited.
 // The image bytes are carried inline as base64 in the shared key's value.

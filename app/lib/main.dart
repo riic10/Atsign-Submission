@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
@@ -50,7 +51,7 @@ class MedShareApp extends StatelessWidget {
   }
 }
 
-enum Role { patient, specialist }
+enum Role { clinic, patient, specialist }
 
 enum _RefStatus { active, revoked, expired, pending }
 
@@ -65,11 +66,11 @@ class _Referral {
 }
 
 const _mockReferrals = <_Referral>[
-  _Referral('Avery Lin', 'avery.lin', 'Knee MRI', 'Expired 2h ago',
+  _Referral('Hailey Fu', 'stellar7gf04_np', 'Knee MRI', 'Expired 2h ago',
       _RefStatus.expired, Color(0xFF6E8BFF)),
-  _Referral('Sam Okafor', 'sam.okafor', 'Dental panoramic',
+  _Referral('Michelle Ho', 'stellar7gf05_np', 'Dental panoramic',
       'Awaiting the patient’s grant', _RefStatus.pending, Color(0xFFE89A5B)),
-  _Referral('Priya Nair', 'priya.nair', 'Chest CT', 'Revoked yesterday',
+  _Referral('Rainie Fu', 'stellar7gf06_np', 'Chest CT', 'Revoked yesterday',
       _RefStatus.revoked, Color(0xFFB58BFF)),
 ];
 
@@ -83,10 +84,16 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   static const _pollInterval = Duration(seconds: 3);
 
-  Role _role = Role.patient;
+  Role _role = Role.clinic;
   bool _busy = false;
 
-  // Patient state: whether a grant is currently outstanding, and when it ends.
+  // Clinic state.
+  bool _clinicDelivered = false;
+
+  // Patient state: the scan received from the clinic, plus whether it's
+  // currently shared onward and when that grant ends.
+  Uint8List? _patientScan;
+  bool _receiving = false; // guards overlapping clinic-delivery reads
   bool _patientShared = false;
   DateTime? _grantExpiry;
 
@@ -100,6 +107,7 @@ class _HomePageState extends State<HomePage> {
 
   String get _specialistHandle => medshare.specialist.replaceFirst('@', '');
   String get _patientHandle => medshare.patient.replaceFirst('@', '');
+  String get _clinicHandle => medshare.clinic.replaceFirst('@', '');
 
   @override
   void initState() {
@@ -130,15 +138,17 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  // Poll only while the specialist pane is visible.
+  // Each pane polls its upstream: the specialist re-reads the patient's grant;
+  // the patient waits for the clinic's delivery (only until it arrives).
   void _syncPolling() {
-    final shouldPoll = _role == Role.specialist;
-    if (shouldPoll && _pollTimer == null) {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+    if (_role == Role.specialist) {
       _pollTimer = Timer.periodic(_pollInterval, (_) => _fetchView());
       _fetchView();
-    } else if (!shouldPoll && _pollTimer != null) {
-      _pollTimer!.cancel();
-      _pollTimer = null;
+    } else if (_role == Role.patient && _patientScan == null) {
+      _pollTimer = Timer.periodic(_pollInterval, (_) => _receiveScan());
+      _receiveScan();
     }
   }
 
@@ -147,12 +157,43 @@ class _HomePageState extends State<HomePage> {
     _syncPolling();
   }
 
+  // Clinic locks the scan and delivers it to the patient.
+  Future<void> _deliver() async {
+    setState(() => _busy = true);
+    try {
+      final data = await rootBundle.load('assets/scan.jpg');
+      await medshare.clinicDeliverScan(data.buffer.asUint8List());
+      if (!mounted) return;
+      setState(() => _clinicDelivered = true);
+    } catch (e) {
+      _toast('Could not deliver: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  // Patient picks up the scan the clinic delivered. Polls until it arrives.
+  Future<void> _receiveScan() async {
+    if (_patientScan != null || _busy || _receiving) return;
+    _receiving = true;
+    try {
+      final bytes = await medshare.patientReceiveScan();
+      if (!mounted || bytes == null) return;
+      setState(() => _patientScan = bytes);
+      _pollTimer?.cancel(); // got it; stop waiting
+      _pollTimer = null;
+    } finally {
+      _receiving = false;
+    }
+  }
+
   Future<void> _grant(Duration ttl, String specialistHandle) async {
+    final scan = _patientScan;
+    if (scan == null) return;
     setState(() => _busy = true);
     try {
       await medshare.setSpecialist(specialistHandle);
-      final data = await rootBundle.load('assets/scan.jpg');
-      await medshare.patientShareImage(data.buffer.asUint8List(), ttl: ttl);
+      await medshare.patientShareImage(scan, ttl: ttl);
       if (!mounted) return;
       setState(() {
         _patientShared = true;
@@ -260,11 +301,7 @@ class _HomePageState extends State<HomePage> {
                   children: [
                     _header(),
                     if (_busy) const LinearProgressIndicator(minHeight: 2),
-                    Expanded(
-                      child: _role == Role.patient
-                          ? _patientBody()
-                          : _specialistBody(),
-                    ),
+                    Expanded(child: _bodyForRole()),
                   ],
                 ),
               ),
@@ -317,6 +354,8 @@ class _HomePageState extends State<HomePage> {
       ),
       child: Row(
         children: [
+          _toggleBtn('Clinic', Role.clinic),
+          const SizedBox(width: 4),
           _toggleBtn('Patient', Role.patient),
           const SizedBox(width: 4),
           _toggleBtn('Specialist', Role.specialist),
@@ -338,6 +377,9 @@ class _HomePageState extends State<HomePage> {
             borderRadius: BorderRadius.circular(9),
           ),
           child: Text(label,
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
@@ -347,9 +389,95 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _bodyForRole() {
+    switch (_role) {
+      case Role.clinic:
+        return _clinicBody();
+      case Role.patient:
+        return _patientBody();
+      case Role.specialist:
+        return _specialistBody();
+    }
+  }
+
+  // ---- Clinic ----
+
+  Widget _clinicBody() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 4, 18, 22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _sectionLabel('Imaging source'),
+          const SizedBox(height: 12),
+          _scanCard(
+            image: Image.asset('assets/scan.jpg', fit: BoxFit.contain),
+            tag: 'New scan',
+            metaTitle: 'Chest X-ray',
+            metaSub: 'Captured · Jun 26, 2026',
+          ),
+          const SizedBox(height: 16),
+          if (_clinicDelivered)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+              decoration: BoxDecoration(
+                color: _goodBg,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: _good.withValues(alpha: 0.4)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.check, size: 20, color: _good),
+                  const SizedBox(width: 11),
+                  Expanded(
+                    child: Text('Delivered to @$_patientHandle',
+                        style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: _goodInk)),
+                  ),
+                ],
+              ),
+            )
+          else
+            _idleRow(Icons.lock_outline, 'Scan locked to the patient'),
+          const Spacer(),
+          _button(_clinicDelivered ? 'Send again' : 'Send scan to patient',
+              _brand, Icons.send, _busy ? null : _deliver),
+        ],
+      ),
+    );
+  }
+
   // ---- Patient ----
 
   Widget _patientBody() {
+    final scan = _patientScan;
+    if (scan == null) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(18, 4, 18, 22),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _sectionLabel('Your scan'),
+            const SizedBox(height: 12),
+            _scanCard(
+              image: const Center(
+                child: Icon(Icons.hourglass_empty,
+                    size: 40, color: Color(0xFF3A4A52)),
+              ),
+              metaTitle: 'No scan yet',
+              metaSub: 'Waiting for your clinic to send it',
+            ),
+            const SizedBox(height: 16),
+            _idleRow(Icons.cloud_download_outlined,
+                'Waiting for the clinic to deliver…'),
+            const Spacer(),
+            _button('Grant specialist access', _brand, null, null),
+          ],
+        ),
+      );
+    }
     return Padding(
       padding: const EdgeInsets.fromLTRB(18, 4, 18, 22),
       child: Column(
@@ -358,13 +486,15 @@ class _HomePageState extends State<HomePage> {
           _sectionLabel('Your scan'),
           const SizedBox(height: 12),
           _scanCard(
-            image: Image.asset('assets/scan.jpg', fit: BoxFit.contain),
+            image: Image.memory(scan, fit: BoxFit.contain, gaplessPlayback: true),
             tag: 'Locked to you',
             metaTitle: 'Chest X-ray',
-            metaSub: 'Jun 26, 2026',
+            metaSub: 'Received from @$_clinicHandle',
           ),
           const SizedBox(height: 16),
-          _patientShared ? _activeStatus() : _idleStatus(),
+          _patientShared
+              ? _activeStatus()
+              : _idleRow(Icons.lock_outline, 'Not shared with anyone'),
           const Spacer(),
           if (_patientShared)
             _button('Revoke access now', _danger, Icons.block,
@@ -385,7 +515,7 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _idleStatus() {
+  Widget _idleRow(IconData icon, String text) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
@@ -393,13 +523,13 @@ class _HomePageState extends State<HomePage> {
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: _line),
       ),
-      child: const Row(
+      child: Row(
         children: [
-          Icon(Icons.lock_outline, size: 20, color: _muted),
-          SizedBox(width: 11),
+          Icon(icon, size: 20, color: _muted),
+          const SizedBox(width: 11),
           Flexible(
-            child: Text('Not shared with anyone',
-                style: TextStyle(fontSize: 14, color: _muted)),
+            child: Text(text,
+                style: const TextStyle(fontSize: 14, color: _muted)),
           ),
         ],
       ),
@@ -502,7 +632,7 @@ class _HomePageState extends State<HomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _referralHeader('Jordan Mei', _patientHandle, 'Chest X-ray', _brand,
+          _referralHeader('Jimmy Fang', _patientHandle, 'Chest X-ray', _brand,
               _statusChip(_RefStatus.active, seconds: left)),
           const SizedBox(height: 12),
           ClipRRect(
@@ -549,7 +679,7 @@ class _HomePageState extends State<HomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _referralHeader('Jordan Mei', _patientHandle, 'Chest X-ray',
+          _referralHeader('Jimmy Fang', _patientHandle, 'Chest X-ray',
               const Color(0xFF7F939B),
               _statusChip(revoked ? _RefStatus.revoked : _RefStatus.pending),
               dark: true),

@@ -8,7 +8,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:headless/medshare.dart' as medshare;
 import 'package:path_provider/path_provider.dart';
 
-// --- ScanShare dark theme tokens ---
+// --- MedShare dark theme tokens ---
 const _bg = Color(0xFF070D10); // app background
 const _panel = Color(0xFF0C1418); // phone panel
 const _surface = Color(0xFF15232B); // cards
@@ -67,7 +67,7 @@ class MedShareApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ScanShare',
+      title: 'MedShare',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
@@ -409,7 +409,7 @@ class _HomePageState extends State<HomePage> {
                 child: const Icon(Icons.shield, size: 14, color: Colors.white),
               ),
               const SizedBox(width: 9),
-              const Text('ScanShare',
+              const Text('MedShare',
                   style: TextStyle(
                       fontSize: 19,
                       fontWeight: FontWeight.w700,
@@ -1403,7 +1403,7 @@ class _SetupScreenState extends State<SetupScreen> {
                             size: 14, color: Colors.white),
                       ),
                       const SizedBox(width: 9),
-                      const Text('ScanShare',
+                      const Text('MedShare',
                           style: TextStyle(
                               fontSize: 19,
                               fontWeight: FontWeight.w700,

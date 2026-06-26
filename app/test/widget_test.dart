@@ -12,7 +12,7 @@ void main() {
     addTearDown(tester.view.resetPhysicalSize);
     addTearDown(tester.view.resetDevicePixelRatio);
 
-    await tester.pumpWidget(const MedShareApp());
+    await tester.pumpWidget(const MedShareApp(configured: true));
     // Single frame only: panes run a 1Hz countdown ticker and network polling,
     // so pumpAndSettle would never settle.
     await tester.pump();

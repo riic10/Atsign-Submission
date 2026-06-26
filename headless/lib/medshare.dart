@@ -6,26 +6,45 @@ import 'dart:typed_data';
 import 'package:at_client/at_client.dart';
 import 'package:at_onboarding_cli/at_onboarding_cli.dart';
 import 'package:at_utils/at_logger.dart';
+import 'package:crypto/crypto.dart';
 
 const namespace = 'medshare';
 const rootDomain = 'root.atsign.org';
 
-// The imaging source that originates the scan and hands it to the patient.
-// Its .atKeys must be present locally to authenticate as the clinic.
-const clinic = '@radium1if01_np';
-const patient = '@stellar7gf01_np';
-
-// The recipient the patient shares with. Mutable so the app can target a
-// different atSign at runtime. Note: the specialist pane must authenticate as
-// this atSign to read, so its .atKeys must exist locally — otherwise the read
-// fails and the view stays dark.
+// The three atSigns in the chain. These default to the demo identities but are
+// mutable so each user can point the app at their own onboarded atSigns. Each
+// atSign's .atKeys must be present locally for the app to authenticate as it.
+String clinic = '@radium1if01_np';
+String patient = '@stellar7gf01_np';
 String specialist = '@stellar7gf02_np';
+
+String _normalize(String atSign) {
+  final t = atSign.trim();
+  return t.startsWith('@') ? t : '@$t';
+}
+
+// Apply a user-supplied set of atSigns (e.g. from the setup screen).
+Future<void> configure({
+  required String clinicAt,
+  required String patientAt,
+  required String specialistAt,
+}) async {
+  clinic = _normalize(clinicAt);
+  patient = _normalize(patientAt);
+  await setSpecialist(specialistAt);
+}
+
+// True if an atSign has its .atKeys file onboarded locally.
+bool hasKeys(String atSign) {
+  final s = atSign.trim();
+  if (s.isEmpty) return false;
+  return File(keysFor(_normalize(s))).existsSync();
+}
 
 // Point sharing at a different specialist. Drops any open specialist session
 // so the next read re-authenticates under the new identity.
 Future<void> setSpecialist(String atSign) async {
-  final trimmed = atSign.trim();
-  final normalized = trimmed.startsWith('@') ? trimmed : '@$trimmed';
+  final normalized = _normalize(atSign);
   if (normalized == specialist) return;
   await closeSpecialist();
   specialist = normalized;
@@ -197,4 +216,56 @@ Future<void> patientRevoke() async {
   await withClient(patient, (client) async {
     await client.delete(scanKey());
   });
+}
+
+// ---- Audit log (design's Audit Log node) ----
+//
+// A tamper-evident, append-only record of every grant, view, and withdrawal.
+// Each entry is chained to the previous one's hash, so any edit or deletion
+// breaks the chain (verify() detects it). Single-writer for the demo, but each
+// entry is stamped with the identity of whoever caused the event.
+class AuditEntry {
+  final int seq;
+  final DateTime time;
+  final String actor; // atSign that caused the event
+  final String action;
+  final String detail;
+  final String prevHash;
+  final String hash;
+  const AuditEntry(this.seq, this.time, this.actor, this.action, this.detail,
+      this.prevHash, this.hash);
+}
+
+class AuditLog {
+  final List<AuditEntry> entries = [];
+
+  String _hashOf(int seq, DateTime time, String actor, String action,
+      String detail, String prev) {
+    final payload =
+        '$seq|${time.toIso8601String()}|$actor|$action|$detail|$prev';
+    return sha256.convert(utf8.encode(payload)).toString();
+  }
+
+  AuditEntry append(String actor, String action, [String detail = '']) {
+    final seq = entries.length;
+    final time = DateTime.now();
+    final prev = entries.isEmpty ? 'GENESIS' : entries.last.hash;
+    final hash = _hashOf(seq, time, actor, action, detail, prev);
+    final entry = AuditEntry(seq, time, actor, action, detail, prev, hash);
+    entries.add(entry);
+    return entry;
+  }
+
+  // Recompute the whole chain; any altered or removed entry breaks it.
+  bool verify() {
+    var prev = 'GENESIS';
+    for (final e in entries) {
+      if (e.prevHash != prev) return false;
+      if (_hashOf(e.seq, e.time, e.actor, e.action, e.detail, prev) != e.hash) {
+        return false;
+      }
+      prev = e.hash;
+    }
+    return true;
+  }
 }

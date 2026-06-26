@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -21,17 +22,47 @@ const _goodInk = Color(0xFF6FD3A6);
 const _danger = Color(0xFFE0694F);
 const _darkBg = Color(0xFF0C1418); // scan area / dark card
 
+File? _configFile;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Point the atSign Hive stores at a stable app-data location instead of
   // the process working directory.
   final dir = await getApplicationSupportDirectory();
-  medshare.storageBase = '${dir.path}${Platform.pathSeparator}storage';
-  runApp(const MedShareApp());
+  final sep = Platform.pathSeparator;
+  medshare.storageBase = '${dir.path}${sep}storage';
+  _configFile = File('${dir.path}${sep}config.json');
+  final configured = await _loadConfig();
+  runApp(MedShareApp(configured: configured));
+}
+
+// Reads saved atSigns and applies them. Returns true if a config was loaded.
+Future<bool> _loadConfig() async {
+  try {
+    if (!await _configFile!.exists()) return false;
+    final json = jsonDecode(await _configFile!.readAsString());
+    await medshare.configure(
+      clinicAt: json['clinic'] as String,
+      patientAt: json['patient'] as String,
+      specialistAt: json['specialist'] as String,
+    );
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+Future<void> _saveConfig() async {
+  await _configFile!.writeAsString(jsonEncode({
+    'clinic': medshare.clinic,
+    'patient': medshare.patient,
+    'specialist': medshare.specialist,
+  }));
 }
 
 class MedShareApp extends StatelessWidget {
-  const MedShareApp({super.key});
+  final bool configured;
+  const MedShareApp({super.key, required this.configured});
 
   @override
   Widget build(BuildContext context) {
@@ -46,12 +77,37 @@ class MedShareApp extends StatelessWidget {
           brightness: Brightness.dark,
         ),
       ),
-      home: const HomePage(),
+      home: Gate(initiallyConfigured: configured),
     );
   }
 }
 
-enum Role { clinic, patient, specialist }
+// Shows the setup screen until atSigns are configured, then the app. The gear
+// in the app header returns here to reconfigure.
+class Gate extends StatefulWidget {
+  final bool initiallyConfigured;
+  const Gate({super.key, required this.initiallyConfigured});
+
+  @override
+  State<Gate> createState() => _GateState();
+}
+
+class _GateState extends State<Gate> {
+  late bool _configured = widget.initiallyConfigured;
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_configured) {
+      return SetupScreen(onSaved: () => setState(() => _configured = true));
+    }
+    return HomePage(
+      key: ValueKey(medshare.clinic + medshare.patient + medshare.specialist),
+      onSettings: () => setState(() => _configured = false),
+    );
+  }
+}
+
+enum Role { clinic, patient, specialist, audit }
 
 enum _RefStatus { active, revoked, expired, pending }
 
@@ -66,16 +122,17 @@ class _Referral {
 }
 
 const _mockReferrals = <_Referral>[
-  _Referral('Hailey Fu', 'stellar7gf04_np', 'Knee MRI', 'Expired 2h ago',
+  _Referral('Hailey Fu', 'haileyfu', 'Knee MRI', 'Expired 2h ago',
       _RefStatus.expired, Color(0xFF6E8BFF)),
-  _Referral('Michelle Ho', 'stellar7gf05_np', 'Dental panoramic',
+  _Referral('Michelle Ho', 'michelleho', 'Dental panoramic',
       'Awaiting the patient’s grant', _RefStatus.pending, Color(0xFFE89A5B)),
-  _Referral('Rainie Fu', 'stellar7gf06_np', 'Chest CT', 'Revoked yesterday',
+  _Referral('Rainie Fu', 'rainiefu', 'Chest CT', 'Revoked yesterday',
       _RefStatus.revoked, Color(0xFFB58BFF)),
 ];
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  final VoidCallback onSettings;
+  const HomePage({super.key, required this.onSettings});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -86,6 +143,8 @@ class _HomePageState extends State<HomePage> {
 
   Role _role = Role.clinic;
   bool _busy = false;
+
+  final _audit = medshare.AuditLog();
 
   // Clinic state.
   bool _clinicDelivered = false;
@@ -122,6 +181,8 @@ class _HomePageState extends State<HomePage> {
         setState(() {
           _grantExpiry = null;
           _patientShared = false;
+          _audit.append(
+              medshare.patient, 'Grant expired', 'for @$_specialistHandle');
         });
       } else {
         setState(() {});
@@ -164,7 +225,11 @@ class _HomePageState extends State<HomePage> {
       final data = await rootBundle.load('assets/scan.jpg');
       await medshare.clinicDeliverScan(data.buffer.asUint8List());
       if (!mounted) return;
-      setState(() => _clinicDelivered = true);
+      setState(() {
+        _clinicDelivered = true;
+        _audit.append(medshare.clinic, 'Delivered locked scan',
+            'to @$_patientHandle');
+      });
     } catch (e) {
       _toast('Could not deliver: $e');
     } finally {
@@ -201,6 +266,8 @@ class _HomePageState extends State<HomePage> {
         // The recipient changed; let the specialist pane re-read fresh.
         _view = null;
         _hasFetched = false;
+        _audit.append(medshare.patient, 'Granted time-limited view',
+            'to @$_specialistHandle · ${_ttlLabel(ttl)}');
       });
     } catch (e) {
       _toast('Could not share: $e');
@@ -217,6 +284,8 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _patientShared = false;
         _grantExpiry = null;
+        _audit.append(
+            medshare.patient, 'Revoked access', 'from @$_specialistHandle');
       });
     } catch (e) {
       _toast('Could not revoke: $e');
@@ -240,6 +309,10 @@ class _HomePageState extends State<HomePage> {
         final wasLit = _view != null && !_view!.isDark;
         final nowLit = !view.isDark;
         if (nowLit) _everLit = true;
+        if (nowLit && !wasLit) {
+          _audit.append(medshare.specialist, 'Opened scan',
+              "@$_patientHandle's Chest X-ray");
+        }
         if (_view == null || nowLit != wasLit) _view = view;
         if (view.isDark) _grantExpiry = null;
       });
@@ -263,6 +336,12 @@ class _HomePageState extends State<HomePage> {
 
   String _fmt(int total) =>
       '${total ~/ 60}:${(total % 60).toString().padLeft(2, '0')}';
+
+  String _ttlLabel(Duration d) {
+    if (d.inSeconds < 60) return '${d.inSeconds}s';
+    if (d.inMinutes < 60) return '${d.inMinutes} min';
+    return '${d.inHours} hr';
+  }
 
   Future<void> _openGrantSheet() async {
     final result = await showModalBottomSheet<(Duration, String)>(
@@ -336,6 +415,14 @@ class _HomePageState extends State<HomePage> {
                       fontWeight: FontWeight.w700,
                       letterSpacing: -0.2,
                       color: _ink)),
+              const Spacer(),
+              IconButton(
+                onPressed: _busy ? null : widget.onSettings,
+                icon: const Icon(Icons.settings_outlined,
+                    size: 20, color: _muted),
+                tooltip: 'Change atSigns',
+                visualDensity: VisualDensity.compact,
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -359,6 +446,8 @@ class _HomePageState extends State<HomePage> {
           _toggleBtn('Patient', Role.patient),
           const SizedBox(width: 4),
           _toggleBtn('Specialist', Role.specialist),
+          const SizedBox(width: 4),
+          _toggleBtn('Audit', Role.audit),
         ],
       ),
     );
@@ -397,6 +486,8 @@ class _HomePageState extends State<HomePage> {
         return _patientBody();
       case Role.specialist:
         return _specialistBody();
+      case Role.audit:
+        return _auditBody();
     }
   }
 
@@ -632,7 +723,7 @@ class _HomePageState extends State<HomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _referralHeader('Jimmy Fang', _patientHandle, 'Chest X-ray', _brand,
+          _referralHeader('Jimmy Fang', 'jimmyfang', 'Chest X-ray', _brand,
               _statusChip(_RefStatus.active, seconds: left)),
           const SizedBox(height: 12),
           ClipRRect(
@@ -679,7 +770,7 @@ class _HomePageState extends State<HomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _referralHeader('Jimmy Fang', _patientHandle, 'Chest X-ray',
+          _referralHeader('Jimmy Fang', 'jimmyfang', 'Chest X-ray',
               const Color(0xFF7F939B),
               _statusChip(revoked ? _RefStatus.revoked : _RefStatus.pending),
               dark: true),
@@ -820,6 +911,152 @@ class _HomePageState extends State<HomePage> {
               TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: fg)),
     );
   }
+
+  // ---- Audit (read-only auditor view of the chained log) ----
+
+  Widget _auditBody() {
+    final entries = _audit.entries;
+    final verified = _audit.verify();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 4, 18, 22),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _sectionLabel('Audit log'),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              color: entries.isEmpty ? _surface : _goodBg,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                  color: entries.isEmpty
+                      ? _line
+                      : _good.withValues(alpha: 0.4)),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                    entries.isEmpty
+                        ? Icons.shield_outlined
+                        : (verified ? Icons.verified_user : Icons.gpp_bad),
+                    size: 18,
+                    color: entries.isEmpty
+                        ? _muted
+                        : (verified ? _good : _danger)),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    entries.isEmpty
+                        ? 'No events yet'
+                        : (verified
+                            ? 'Chain verified · ${entries.length} event${entries.length == 1 ? '' : 's'}'
+                            : 'Chain broken — tampering detected'),
+                    style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: entries.isEmpty
+                            ? _muted
+                            : (verified ? _goodInk : _danger)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: entries.isEmpty
+                ? const Center(
+                    child: Text(
+                        'Grants, views and revocations will appear here.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 12.5, color: _muted)),
+                  )
+                : ListView.separated(
+                    itemCount: entries.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (_, i) =>
+                        _auditTile(entries[entries.length - 1 - i]),
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _auditTile(medshare.AuditEntry e) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _line),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(_auditIcon(e.action), size: 18, color: _brand),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(e.action,
+                        style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: _ink)),
+                    if (e.detail.isNotEmpty)
+                      Text(e.detail,
+                          style:
+                              const TextStyle(fontSize: 12.5, color: _muted)),
+                  ],
+                ),
+              ),
+              Text(_clock(e.time),
+                  style: const TextStyle(fontSize: 12, color: _muted)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Text('@${e.actor.replaceFirst('@', '')}',
+                  style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF6E808A))),
+              const Spacer(),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: _darkBg,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: _line),
+                ),
+                child: Text('#${e.seq} · ${e.hash.substring(0, 10)}',
+                    style: const TextStyle(
+                        fontSize: 10.5, color: Color(0xFF7FA6AE))),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  IconData _auditIcon(String action) {
+    if (action.startsWith('Delivered')) return Icons.send;
+    if (action.startsWith('Granted')) return Icons.lock_open;
+    if (action.startsWith('Opened')) return Icons.visibility;
+    if (action.startsWith('Revoked')) return Icons.block;
+    return Icons.timer_off;
+  }
+
+  String _clock(DateTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}:${t.second.toString().padLeft(2, '0')}';
 
   // ---- Shared building blocks ----
 
@@ -1082,6 +1319,218 @@ class _GrantSheetState extends State<_GrantSheet> {
           ],
         ),
       ),
+    );
+  }
+}
+
+// First-run / settings screen: each user enters the three atSigns of their own
+// chain. Each must be onboarded (its .atKeys present) to authenticate.
+class SetupScreen extends StatefulWidget {
+  final VoidCallback onSaved;
+  const SetupScreen({super.key, required this.onSaved});
+
+  @override
+  State<SetupScreen> createState() => _SetupScreenState();
+}
+
+class _SetupScreenState extends State<SetupScreen> {
+  late final _clinic =
+      TextEditingController(text: medshare.clinic.replaceFirst('@', ''));
+  late final _patient =
+      TextEditingController(text: medshare.patient.replaceFirst('@', ''));
+  late final _specialist =
+      TextEditingController(text: medshare.specialist.replaceFirst('@', ''));
+  bool _saving = false;
+
+  @override
+  void dispose() {
+    _clinic.dispose();
+    _patient.dispose();
+    _specialist.dispose();
+    super.dispose();
+  }
+
+  bool get _ready =>
+      _clinic.text.trim().isNotEmpty &&
+      _patient.text.trim().isNotEmpty &&
+      _specialist.text.trim().isNotEmpty;
+
+  Future<void> _save() async {
+    if (!_ready || _saving) return;
+    setState(() => _saving = true);
+    try {
+      await medshare.configure(
+        clinicAt: _clinic.text,
+        patientAt: _patient.text,
+        specialistAt: _specialist.text,
+      );
+      await _saveConfig();
+      widget.onSaved();
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Container(
+              padding: const EdgeInsets.all(22),
+              decoration: BoxDecoration(
+                color: _panel,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: const Color(0xFF1A2730)),
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 24,
+                        height: 24,
+                        decoration: BoxDecoration(
+                          color: _brand,
+                          borderRadius: BorderRadius.circular(7),
+                        ),
+                        child: const Icon(Icons.shield,
+                            size: 14, color: Colors.white),
+                      ),
+                      const SizedBox(width: 9),
+                      const Text('ScanShare',
+                          style: TextStyle(
+                              fontSize: 19,
+                              fontWeight: FontWeight.w700,
+                              color: _ink)),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  const Text('Set up the chain',
+                      style: TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                          color: _ink)),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Enter the three atSigns to use. Each must already be '
+                    'onboarded on this machine (its .atKeys file in '
+                    '~/.atsign/keys/).',
+                    style: TextStyle(fontSize: 13, color: _muted, height: 1.5),
+                  ),
+                  const SizedBox(height: 18),
+                  _field('Clinic / imaging source', _clinic),
+                  const SizedBox(height: 14),
+                  _field('Patient', _patient),
+                  const SizedBox(height: 14),
+                  _field('Specialist', _specialist),
+                  const SizedBox(height: 22),
+                  SizedBox(
+                    height: 52,
+                    child: FilledButton(
+                      style: FilledButton.styleFrom(
+                        backgroundColor: _brand,
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: _brand.withValues(alpha: 0.4),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(14)),
+                      ),
+                      onPressed: _ready && !_saving ? _save : null,
+                      child: Text(_saving ? 'Saving…' : 'Continue',
+                          style: const TextStyle(
+                              fontSize: 15, fontWeight: FontWeight.w700)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _field(String label, TextEditingController controller) {
+    final value = controller.text.trim();
+    final hasKeys = value.isNotEmpty && medshare.hasKeys(value);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(label.toUpperCase(),
+            style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.5,
+                color: _muted)),
+        const SizedBox(height: 6),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+          decoration: BoxDecoration(
+            color: _surface,
+            border: Border.all(color: _line),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            children: [
+              const Text('@',
+                  style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      color: _brand,
+                      fontSize: 15)),
+              const SizedBox(width: 9),
+              Expanded(
+                child: TextField(
+                  controller: controller,
+                  cursorColor: _brand,
+                  onChanged: (_) => setState(() {}),
+                  style: const TextStyle(
+                      fontSize: 15, fontWeight: FontWeight.w600, color: _ink),
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isCollapsed: true,
+                    contentPadding: EdgeInsets.symmetric(vertical: 14),
+                    hintText: 'youratsign',
+                    hintStyle: TextStyle(color: _muted),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 5),
+        Row(
+          children: [
+            Icon(
+                value.isEmpty
+                    ? Icons.remove
+                    : (hasKeys ? Icons.check_circle : Icons.error_outline),
+                size: 14,
+                color: value.isEmpty
+                    ? _muted
+                    : (hasKeys ? _good : const Color(0xFFE0B872))),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(
+                value.isEmpty
+                    ? 'Enter an atSign'
+                    : (hasKeys
+                        ? 'Keys found in ~/.atsign/keys/'
+                        : 'No .atKeys for this atSign yet'),
+                style: TextStyle(
+                    fontSize: 11.5,
+                    color: value.isEmpty
+                        ? _muted
+                        : (hasKeys ? _goodInk : const Color(0xFFE0B872))),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 }

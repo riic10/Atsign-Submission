@@ -10,7 +10,22 @@ import 'package:at_utils/at_logger.dart';
 const namespace = 'medshare';
 const rootDomain = 'root.atsign.org';
 const patient = '@stellar7gf01_np';
-const specialist = '@stellar7gf02_np';
+
+// The recipient the patient shares with. Mutable so the app can target a
+// different atSign at runtime. Note: the specialist pane must authenticate as
+// this atSign to read, so its .atKeys must exist locally — otherwise the read
+// fails and the view stays dark.
+String specialist = '@stellar7gf02_np';
+
+// Point sharing at a different specialist. Drops any open specialist session
+// so the next read re-authenticates under the new identity.
+Future<void> setSpecialist(String atSign) async {
+  final trimmed = atSign.trim();
+  final normalized = trimmed.startsWith('@') ? trimmed : '@$trimmed';
+  if (normalized == specialist) return;
+  await closeSpecialist();
+  specialist = normalized;
+}
 
 String keysFor(String atSign) {
   final home =

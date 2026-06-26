@@ -68,7 +68,10 @@ class _HomePageState extends State<HomePage> {
   void initState() {
     super.initState();
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
+      // Only repaint when a countdown is actually on screen.
+      if (mounted && _role == Role.specialist && _grantExpiry != null) {
+        setState(() {});
+      }
     });
     _syncPolling();
   }
@@ -77,6 +80,7 @@ class _HomePageState extends State<HomePage> {
   void dispose() {
     _pollTimer?.cancel();
     _ticker?.cancel();
+    medshare.closeSpecialist();
     super.dispose();
   }
 

@@ -24,17 +24,18 @@ String keysFor(String atSign) {
 // so it doesn't depend on the working directory.
 String storageBase = 'storage';
 
+AtOnboardingPreference _preferenceFor(String atSign) => AtOnboardingPreference()
+  ..namespace = namespace
+  ..rootDomain = rootDomain
+  ..atKeysFilePath = keysFor(atSign)
+  ..hiveStoragePath = '$storageBase/$atSign/hive'
+  ..commitLogPath = '$storageBase/$atSign/commitLog'
+  ..isLocalStoreRequired = true;
+
 Future<void> withClient(
     String atSign, Future<void> Function(AtClient) body) async {
   AtSignLogger.root_level = 'warning';
-  final preference = AtOnboardingPreference()
-    ..namespace = namespace
-    ..rootDomain = rootDomain
-    ..atKeysFilePath = keysFor(atSign)
-    ..hiveStoragePath = '$storageBase/$atSign/hive'
-    ..commitLogPath = '$storageBase/$atSign/commitLog'
-    ..isLocalStoreRequired = true;
-  final onboarding = AtOnboardingServiceImpl(atSign, preference);
+  final onboarding = AtOnboardingServiceImpl(atSign, _preferenceFor(atSign));
   await onboarding.authenticate();
   try {
     final client = onboarding.atClient!;
@@ -57,7 +58,7 @@ Future<void> drainPush(AtClient client,
     if (DateTime.now().isAfter(deadline)) {
       throw TimeoutException('push queue did not drain within $timeout');
     }
-    await Future.delayed(const Duration(milliseconds: 400));
+    await Future<void>.delayed(const Duration(milliseconds: 400));
   }
 }
 
@@ -94,25 +95,46 @@ class ScanView {
   bool get isDark => bytes == null;
 }
 
+// A long-lived specialist session. Polling re-reads through this one
+// authenticated client instead of re-onboarding on every fetch.
+AtOnboardingService? _specialistSession;
+
+Future<AtClient> _specialistClient() async {
+  var session = _specialistSession;
+  if (session == null) {
+    AtSignLogger.root_level = 'warning';
+    session = AtOnboardingServiceImpl(specialist, _preferenceFor(specialist));
+    await session.authenticate();
+    _specialistSession = session;
+  }
+  return session.atClient!;
+}
+
+// Closes the specialist session (call when the reader is done polling).
+Future<void> closeSpecialist() async {
+  await _specialistSession?.close();
+  _specialistSession = null;
+}
+
 // Specialist reads the scan. Returns the image bytes while the grant is
-// active, or a dark view once it has been revoked or has expired.
+// active, or a dark view for any failure: revoked/expired key, a value that
+// isn't decodable, or a transient network error. The reader's contract is
+// simply "can I see the scan right now or not", so every failure is dark.
 Future<ScanView> specialistReadImage() async {
-  ScanView out = const ScanView(null, null);
-  await withClient(specialist, (client) async {
-    try {
-      final result = await client.get(
-        scanKey(),
-        getRequestOptions: GetRequestOptions()..bypassCache = true,
-      );
-      final value = result.value;
-      if (value is String && value.isNotEmpty) {
-        out = ScanView(base64Decode(value), result.metadata?.expiresAt);
-      }
-    } on AtKeyNotFoundException {
-      out = const ScanView(null, null);
+  try {
+    final client = await _specialistClient();
+    final result = await client.get(
+      scanKey(),
+      getRequestOptions: GetRequestOptions()..bypassCache = true,
+    );
+    final value = result.value;
+    if (value is String && value.isNotEmpty) {
+      return ScanView(base64Decode(value), result.metadata?.expiresAt);
     }
-  });
-  return out;
+  } catch (_) {
+    // Fall through to a dark view.
+  }
+  return const ScanView(null, null);
 }
 
 // Patient revokes the grant: deleting the shared key cascade-deletes the
